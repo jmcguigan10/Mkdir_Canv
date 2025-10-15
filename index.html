@@ -24,7 +24,7 @@
       linear-gradient(90deg, #1b1b1b 1px, transparent 1px) 0 0/var(--s) 100%;
     position:absolute; inset:0;
   }
-  svg.wires { position:absolute; inset:0; z-index:0; pointer-events: none; }
+  svg.wires { position:absolute; inset:0; z-index:0; pointer-events: none; width:100%; height:100%; overflow:visible; }
   .nodes { position:absolute; inset:0; z-index:1; }
 
   .node {
@@ -89,6 +89,26 @@
       const r = el.getBoundingClientRect();
       const s = stageRect();
       return { x: r.left - s.left + r.width/2, y: r.top - s.top + r.height/2 };
+    }
+
+    function portCenter(el){
+      const port = el.querySelector('.port');
+      if (!port) return centerOf(el);
+      const r = port.getBoundingClientRect();
+      const s = stageRect();
+      return { x: r.left - s.left + r.width/2, y: r.top - s.top + r.height/2 };
+    }
+
+    function extendedSegment(a, b, extra = 24){
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      return {
+        x1: a.x - (dx / len) * extra,
+        y1: a.y - (dy / len) * extra,
+        x2: b.x + (dx / len) * extra,
+        y2: b.y + (dy / len) * extra,
+      };
     }
 
     function prettySize(bytes){
@@ -161,7 +181,7 @@
       port.addEventListener('pointerdown', e => {
         e.preventDefault();
         e.stopPropagation();
-        const { x, y } = centerOf(el);
+        const { x, y } = portCenter(el);
         const temp = line(x, y, x, y, true);
         state.link = { sourceId: node.id, tempLine: temp, hoverId: null };
         document.addEventListener('pointermove', onLinkMove);
@@ -209,15 +229,16 @@
         const fromEl = nodesEl.querySelector(`.node[data-id="${node.id}"]`);
         const toEl   = nodesEl.querySelector(`.node[data-id="${node.parentId}"]`);
         if (!fromEl || !toEl) continue;
-        const a = centerOf(fromEl), b = centerOf(toEl);
-        line(a.x, a.y, b.x, b.y, false);
+        const a = portCenter(fromEl), b = portCenter(toEl);
+        const { x1, y1, x2, y2 } = extendedSegment(a, b);
+        line(x1, y1, x2, y2, false);
       }
     }
 
     function onLinkMove(e){
       if (!state.link) return;
       const srcEl = nodesEl.querySelector(`.node[data-id="${state.link.sourceId}"]`);
-      const a = centerOf(srcEl);
+      const a = portCenter(srcEl);
       const s = stageRect();
       const x = e.clientX - s.left;
       const y = e.clientY - s.top;
