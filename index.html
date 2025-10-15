@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Visual Filesystem Prototyper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --bg:#111; --panel:#1c1c1c; --ink:#ddd; --muted:#9aa0a6; --accent:#6ea8fe; --bad:#ff6b6b; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  /* kill selection across the app for this proto */
+  body { -webkit-user-select: none; user-select: none; }
+  header { display:flex; gap:8px; align-items:center; padding:10px; background: var(--panel); border-bottom: 1px solid #2a2a2a; position: sticky; top:0; z-index: 3; }
+  header .btn { padding:6px 10px; border:1px solid #2f2f2f; background:#222; color:var(--ink); border-radius:6px; cursor:pointer; }
+  header .btn:hover { border-color:#3a3a3a; }
+  header input[type=file] { display:none; }
+  header label[for=picker] { padding:6px 10px; border:1px dashed #3a3a3a; border-radius:6px; cursor:pointer; color: var(--muted); }
+  header .hint { color: var(--muted); margin-left: auto; }
+
+  .stage { position: relative; height: calc(100% - 50px); touch-action: none; }
+  .grid {
+    --s: 20px;
+    background:
+      linear-gradient(#1b1b1b 1px, transparent 1px) 0 0/100% var(--s),
+      linear-gradient(90deg, #1b1b1b 1px, transparent 1px) 0 0/var(--s) 100%;
+    position:absolute; inset:0;
+  }
+  svg.wires { position:absolute; inset:0; z-index:0; pointer-events: none; }
+  .nodes { position:absolute; inset:0; z-index:1; }
+
+  .node {
+    position:absolute; min-width:120px; max-width:220px;
+    background:#1b1b1b; border:1px solid #2c2c2c; border-radius:10px;
+    padding:10px 10px 6px; cursor:grab; -webkit-user-drag:none; user-select:none; touch-action:none;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  }
+  .node.dragging { cursor:grabbing; }
+  .node .title { font-weight:600; margin-bottom:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .node.file { border-left: 4px solid #7fd3a6; }
+  .node.dir  { border-left: 4px solid #6ea8fe; }
+  .node .meta { font-size:12px; color: var(--muted); }
+  .port {
+    width:12px; height:12px; border-radius:50%;
+    background: var(--accent); position:absolute; right:-6px; top:50%; transform: translateY(-50%);
+    border: 2px solid #101010; cursor: crosshair;
+  }
+
+  .drop-ok { outline: 2px dashed var(--accent); outline-offset: 2px; }
+  .drop-bad { outline: 2px dashed var(--bad); outline-offset: 2px; }
+
+  .wire { stroke: #6ea8fe; stroke-width: 2; opacity: 0.95; }
+  .wire.temp { stroke-dasharray: 6 4; }
+</style>
+</head>
+<body>
+  <header>
+    <button class="btn" id="newDir">New Directory</button>
+    <label for="picker">Add files…</label>
+    <input id="picker" type="file" multiple />
+    <button class="btn" id="exportZip">Export Zip</button>
+    <span class="hint">Tip: drop a folder to import its tree. Drag from the blue dot to connect to a directory.</span>
+  </header>
+
+  <div class="stage" id="stage">
+    <div class="grid"></div>
+    <svg class="wires" id="wires"></svg>
+    <div class="nodes" id="nodes"></div>
+  </div>
+
+  <!-- JSZip -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script>
+  (function(){
+    const stage   = document.getElementById('stage');
+    const nodesEl = document.getElementById('nodes');
+    const wiresEl = document.getElementById('wires');
+    const picker  = document.getElementById('picker');
+
+    const state = {
+      nextId: 1,
+      nodes: new Map(),  // id -> { id, type: 'file'|'dir', name, x, y, file?, parentId?, children:Set }
+      drag: null,        // { id, dx, dy, pointerId, el }
+      link: null,        // { sourceId, tempLine, hoverId }
+    };
+
+    function uid(){ return String(state.nextId++); }
+    function stageRect(){ return stage.getBoundingClientRect(); }
+
+    function centerOf(el){
+      const r = el.getBoundingClientRect();
+      const s = stageRect();
+      return { x: r.left - s.left + r.width/2, y: r.top - s.top + r.height/2 };
+    }
+
+    function prettySize(bytes){
+      if (!bytes) return 'empty';
+      const u = ['B','KB','MB','GB','TB'];
+      let i = 0; let n = bytes;
+      while (n >= 1024 && i < u.length - 1){ n /= 1024; i++; }
+      return `${n.toFixed(1)} ${u[i]}`;
+    }
+
+    function makeNodeEl(node){
+      const el = document.createElement('div');
+      el.className = `node ${node.type}`;
+      el.dataset.id = node.id;
+      el.style.left = `${node.x}px`;
+      el.style.top  = `${node.y}px`;
+
+      const title = document.createElement('div');
+      title.className = 'title';
+      title.textContent = node.name;
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = node.type === 'file' ? prettySize(node.file?.size || 0) : 'directory';
+
+      const port = document.createElement('div');
+      port.className = 'port';
+      port.title = 'Drag to connect';
+
+      el.appendChild(title);
+      el.appendChild(meta);
+      el.appendChild(port);
+
+      // Move: pointer capture, no accidental selection
+      el.addEventListener('pointerdown', e => {
+        if (e.target === port) return; // linking handled separately
+        e.preventDefault();
+        const rect = el.getBoundingClientRect();
+        state.drag = { id: node.id, dx: e.clientX - rect.left, dy: e.clientY - rect.top, pointerId: e.pointerId, el };
+        el.classList.add('dragging');
+        el.setPointerCapture(e.pointerId);
+      });
+
+      el.addEventListener('pointermove', e => {
+        if (!state.drag || state.drag.id !== node.id || e.pointerId !== state.drag.pointerId) return;
+        e.preventDefault();
+        const s = stageRect();
+        let x = e.clientX - s.left - state.drag.dx;
+        let y = e.clientY - s.top  - state.drag.dy;
+        // Keep inside stage
+        x = Math.max(0, Math.min(x, stage.clientWidth - el.offsetWidth));
+        y = Math.max(0, Math.min(y, stage.clientHeight - el.offsetHeight));
+        node.x = x; node.y = y;
+        el.style.left = `${x}px`; el.style.top = `${y}px`;
+        redrawWires();
+      });
+
+      function endDrag(e){
+        if (!state.drag || state.drag.id !== node.id) return;
+        state.drag = null;
+        el.classList.remove('dragging');
+        try { el.releasePointerCapture(e.pointerId); } catch {}
+      }
+
+      el.addEventListener('pointerup', endDrag);
+      el.addEventListener('pointercancel', endDrag);
+      el.addEventListener('lostpointercapture', endDrag);
+
+      // Link start
+      port.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const { x, y } = centerOf(el);
+        const temp = line(x, y, x, y, true);
+        state.link = { sourceId: node.id, tempLine: temp, hoverId: null };
+        document.addEventListener('pointermove', onLinkMove);
+        document.addEventListener('pointerup', onLinkEnd, { once:true });
+      });
+
+      nodesEl.appendChild(el);
+      return el;
+    }
+
+    function addDirectory(name = `folder-${state.nextId}`, x = 40, y = 40){
+      const id = uid();
+      const node = { id, type:'dir', name, x, y, children: new Set(), parentId: null };
+      state.nodes.set(id, node);
+      makeNodeEl(node);
+      redrawWires();
+      return node;
+    }
+
+    function addFileNode(file, x = 120, y = 120){
+      const id = uid();
+      const name = file.name || `file-${id}`;
+      const node = { id, type:'file', name, file, x, y, parentId: null };
+      state.nodes.set(id, node);
+      makeNodeEl(node);
+      redrawWires();
+      return node;
+    }
+
+    function line(x1,y1,x2,y2, temp=false){
+      const l = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      l.setAttribute('x1', x1); l.setAttribute('y1', y1);
+      l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+      l.classList.add('wire'); if (temp) l.classList.add('temp');
+      wiresEl.appendChild(l);
+      return l;
+    }
+
+    function redrawWires(){
+      // clear all except temp
+      [...wiresEl.querySelectorAll('line.wire:not(.temp)')].forEach(n => n.remove());
+      // draw current parent links
+      for (const node of state.nodes.values()){
+        if (!node.parentId) continue;
+        const fromEl = nodesEl.querySelector(`.node[data-id="${node.id}"]`);
+        const toEl   = nodesEl.querySelector(`.node[data-id="${node.parentId}"]`);
+        if (!fromEl || !toEl) continue;
+        const a = centerOf(fromEl), b = centerOf(toEl);
+        line(a.x, a.y, b.x, b.y, false);
+      }
+    }
+
+    function onLinkMove(e){
+      if (!state.link) return;
+      const srcEl = nodesEl.querySelector(`.node[data-id="${state.link.sourceId}"]`);
+      const a = centerOf(srcEl);
+      const s = stageRect();
+      const x = e.clientX - s.left;
+      const y = e.clientY - s.top;
+      state.link.tempLine.setAttribute('x1', a.x);
+      state.link.tempLine.setAttribute('y1', a.y);
+      state.link.tempLine.setAttribute('x2', x);
+      state.link.tempLine.setAttribute('y2', y);
+
+      // hover highlight
+      const target = document.elementFromPoint(e.clientX, e.clientY);
+      const dirEl = target && target.closest?.('.node.dir');
+      highlightDrop(dirEl);
+      state.link.hoverId = dirEl ? dirEl.dataset.id : null;
+    }
+
+    function highlightDrop(dirEl){
+      // reset all
+      nodesEl.querySelectorAll('.node.dir').forEach(n => n.classList.remove('drop-ok','drop-bad'));
+      if (!dirEl || !state.link) return;
+      const ok = canAttach(state.link.sourceId, dirEl.dataset.id);
+      dirEl.classList.add(ok ? 'drop-ok' : 'drop-bad');
+    }
+
+    function onLinkEnd(){
+      document.removeEventListener('pointermove', onLinkMove);
+      if (!state.link) return;
+      state.link.tempLine.remove();
+      nodesEl.querySelectorAll('.node.dir').forEach(n => n.classList.remove('drop-ok','drop-bad'));
+      const { sourceId, hoverId } = state.link;
+      state.link = null;
+      if (!hoverId) return;
+      if (canAttach(sourceId, hoverId)){
+        attach(sourceId, hoverId);
+        redrawWires();
+      }
+    }
+
+    function canAttach(childId, dirId){
+      const child = state.nodes.get(childId);
+      const parent = state.nodes.get(dirId);
+      if (!child || !parent) return false;
+      if (parent.type !== 'dir') return false;
+      if (childId === dirId) return false;
+      // prevent cycles for dir -> dir
+      if (child.type === 'dir'){
+        let p = parent;
+        while (p){
+          if (p.id === child.id) return false;
+          p = p.parentId ? state.nodes.get(p.parentId) : null;
+        }
+      }
+      return true;
+    }
+
+    function attach(childId, dirId){
+      const child = state.nodes.get(childId);
+      const parent = state.nodes.get(dirId);
+      if (!child || !parent) return;
+      // remove from old parent
+      if (child.parentId){
+        const old = state.nodes.get(child.parentId);
+        old?.children?.delete(childId);
+      }
+      child.parentId = parent.id;
+      parent.children?.add(childId);
+    }
+
+    // File input (files only, not folders)
+    picker.addEventListener('change', e => {
+      const s = stageRect();
+      let offset = 40;
+      for (const f of e.target.files){
+        addFileNode(f, 100 + (offset%200), 120 + (offset%200));
+        offset += 24;
+      }
+      picker.value = '';
+    });
+
+    // DnD wiring
+    ;['dragenter','dragover','dragleave','drop'].forEach(evt => {
+      stage.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
+    });
+
+    // Drop handler with folder support
+    stage.addEventListener('drop', async e => {
+      const s = stageRect();
+      const dropX = e.clientX - s.left;
+      const dropY = e.clientY - s.top;
+
+      const items = Array.from(e.dataTransfer?.items || []);
+      const hasTraverseAPI = items.some(it => typeof it.getAsFileSystemHandle === 'function' || typeof it.webkitGetAsEntry === 'function');
+
+      if (hasTraverseAPI){
+        await importDroppedItems(items, dropX, dropY);
+        redrawWires();
+        return;
+      }
+
+      // Fallback: flat files only
+      const files = [...(e.dataTransfer?.files || [])];
+      let offset = 0;
+      for (const f of files){
+        addFileNode(f, dropX + offset, dropY + offset);
+        offset += 18;
+      }
+    });
+
+    async function importDroppedItems(items, baseX, baseY){
+      // simple column layout by depth
+      const dx = 200, dy = 90;
+      const columnY = new Map(); // depth -> next y
+      function nextPos(depth){
+        const x = baseX + depth*dx;
+        const y = columnY.get(depth) ?? baseY;
+        columnY.set(depth, y + dy);
+        return { x, y };
+      }
+
+      // Two traversal backends: File System Access API and webkit entries
+      const tasks = [];
+
+      for (const item of items){
+        if (typeof item.getAsFileSystemHandle === 'function'){
+          const handle = await item.getAsFileSystemHandle();
+          if (!handle) continue;
+          tasks.push(traverseHandle(handle, null, 0));
+        } else if (typeof item.webkitGetAsEntry === 'function'){
+          const entry = item.webkitGetAsEntry();
+          if (!entry) continue;
+          tasks.push(traverseEntry(entry, null, 0));
+        }
+      }
+
+      await Promise.all(tasks);
+
+      async function traverseHandle(handle, parentDirId, depth){
+        if (handle.kind === 'file'){
+          const file = await handle.getFile();
+          const { x, y } = nextPos(depth);
+          const node = addFileNode(file, x, y);
+          if (parentDirId) attach(node.id, parentDirId);
+          return;
+        }
+        if (handle.kind === 'directory'){
+          const { x, y } = nextPos(depth);
+          const dirNode = addDirectory(handle.name, x, y);
+          if (parentDirId) attach(dirNode.id, parentDirId);
+          // entries(): async iterator of [name, childHandle]
+          for await (const [, child] of handle.entries()){
+            await traverseHandle(child, dirNode.id, depth + 1);
+          }
+        }
+      }
+
+      function readAllEntries(dirEntry){
+        const reader = dirEntry.createReader();
+        return new Promise((resolve, reject) => {
+          const out = [];
+          function pump(){
+            reader.readEntries(batch => {
+              if (batch.length){ out.push(...batch); pump(); }
+              else resolve(out);
+            }, reject);
+          }
+          pump();
+        });
+      }
+
+      function getFileFromEntry(fileEntry){
+        return new Promise((resolve, reject) => fileEntry.file(resolve, reject));
+      }
+
+      async function traverseEntry(entry, parentDirId, depth){
+        if (entry.isFile){
+          const file = await getFileFromEntry(entry);
+          const { x, y } = nextPos(depth);
+          const node = addFileNode(file, x, y);
+          if (parentDirId) attach(node.id, parentDirId);
+          return;
+        }
+        if (entry.isDirectory){
+          const { x, y } = nextPos(depth);
+          const dirNode = addDirectory(entry.name, x, y);
+          if (parentDirId) attach(dirNode.id, parentDirId);
+          const children = await readAllEntries(entry);
+          for (const child of children){
+            await traverseEntry(child, dirNode.id, depth + 1);
+          }
+        }
+      }
+    }
+
+    document.getElementById('newDir').addEventListener('click', () => {
+      const x = 40 + Math.round(Math.random()*200);
+      const y = 40 + Math.round(Math.random()*120);
+      addDirectory(undefined, x, y);
+    });
+
+    document.getElementById('exportZip').addEventListener('click', async () => {
+      if (typeof JSZip === 'undefined'){ alert('JSZip failed to load.'); return; }
+      const zip = new JSZip();
+      const usedPaths = new Set();
+
+      function safePath(p){
+        if (!usedPaths.has(p)){ usedPaths.add(p); return p; }
+        let i = 2;
+        const m = p.match(/(\.[^./]+)$/);
+        const ext = m ? m[1] : '';
+        const stem = ext ? p.slice(0, -ext.length) : p;
+        let candidate = `${stem} (${i})${ext}`;
+        while (usedPaths.has(candidate)){ i++; candidate = `${stem} (${i})${ext}`; }
+        usedPaths.add(candidate);
+        return candidate;
+      }
+
+      function pathFor(node){
+        const parts = [node.name];
+        let p = node.parentId ? state.nodes.get(node.parentId) : null;
+        while (p){ parts.unshift(p.name); p = p.parentId ? state.nodes.get(p.parentId) : null; }
+        return parts.join('/');
+      }
+
+      // Ensure empty directories exist
+      for (const n of state.nodes.values()){
+        if (n.type !== 'dir') continue;
+        const p = pathFor(n);
+        const hasChildren = n.children && n.children.size > 0;
+        if (!hasChildren){
+          zip.file(`${p}/.keep`, '');
+        }
+      }
+
+      // Add files
+      for (const n of state.nodes.values()){
+        if (n.type !== 'file') continue;
+        let p = pathFor(n);
+        p = safePath(p); // avoid collisions
+        zip.file(p, n.file);
+      }
+
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'project.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    });
+
+    // initial seed
+    addDirectory('root', 60, 80);
+  })();
+  </script>
+</body>
+</html>
